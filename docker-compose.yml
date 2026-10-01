@@ -1,0 +1,30 @@
+# KEV System One — serve API for clients (e.g. ofertas attach pipeline).
+#
+#   cd ~/.kev && docker compose up --build -d
+#   curl -s http://127.0.0.1:8009/v1/models
+#   curl -s http://127.0.0.1:8009/v1/systemone -H 'content-type: application/json' -d '...'
+#
+# Clients: KEV_BASE_URL=http://127.0.0.1:8009
+
+services:
+  kev:
+    container_name: kev-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${KEV_PORT:-8009}:8009"
+    environment:
+      KEV_HOST: "0.0.0.0"
+      KEV_MODEL_RUN: ${KEV_MODEL_RUN:-jaredpalmer/kev-0.8b}
+      HF_HOME: /models
+      KEV_DTYPE: ${KEV_DTYPE:-}
+      KEV_BACKEND: ${KEV_BACKEND:-}
+    volumes:
+      - kev-hf:/models
+    mem_limit: ${KEV_MEM_LIMIT:-8g}
+    restart: unless-stopped
+
+volumes:
+  kev-hf:
+    driver: local

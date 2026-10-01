@@ -7,6 +7,7 @@ import torch
 
 from kev import evaluate
 from kev.data import materialize
+from kev.suite import record_digest
 from kev.train import question_loss
 
 
@@ -592,8 +593,7 @@ def test_repeat_pull_refetches_trial_dirs_copied_mid_run(monkeypatch, tmp_path, 
     volume = {"00-trial-0": True, "01-trial-1": True, "02-trial-2": True, "03-trial-3": False}   # name -> finished on the volume
     fetched, aggregated = [], []
 
-    def pull_volume(remote, local_parent, weights=True):
-        assert weights is False   # a study pull leaves full-weight shards on the volume by default
+    def pull_volume(remote, local_parent):
         name = remote.rsplit("/", 1)[1]
         fetched.append(name)
         (local_parent / name).mkdir()
@@ -631,25 +631,21 @@ def test_locked_test_passes_timeout_and_memory_through(monkeypatch, tmp_path):
 
 
 class FakeServed:
-    """encode/probs_batch (the served path) over materialized records. Alone, a question prefers its last option;
-    `leak(others)` (the other questions' instructions in the same request) is added to option 0's logit, i.e. broken
-    isolation."""
+    """encode/probs_and_prefix over materialized records. Alone, a question prefers its last option; `leak(others)`
+    (the other questions' instructions in the same request) is added to option 0's logit, i.e. broken isolation."""
     def __init__(self, leak=lambda others: 0.0):
         self.leak = leak
 
-    def encode(self, tok, rec, **limits):   # the serving limits kev.model.admit passes
+    def encode(self, tok, rec):
         return rec
 
-    def probs_batch(self, recs, prefixes, keep):
+    def probs_and_prefix(self, rec):
         out = []
-        for rec in recs:
-            probs = []
-            for i, q in enumerate(rec["questions"]):
-                logits = torch.arange(len(q["options"]), dtype=torch.float)
-                logits[0] += self.leak([o["instr"] for j, o in enumerate(rec["questions"]) if j != i])
-                probs.append(torch.softmax(logits, 0))
-            out.append(probs)
-        return out, [None] * len(recs)
+        for i, q in enumerate(rec["questions"]):
+            logits = torch.arange(len(q["options"]), dtype=torch.float)
+            logits[0] += self.leak([o["instr"] for j, o in enumerate(rec["questions"]) if j != i])
+            out.append(torch.softmax(logits, 0))
+        return out, None
 
 
 def test_served_isolation_compares_alone_with_packed_and_sibling():
@@ -910,6 +906,61 @@ def test_frozen_suites_load_under_any_locale(tmp_path):
     assert "*.jsonl text eol=lf" in attributes and "*.json text eol=lf" in attributes
 
 
+def test_semif_external_rows_convert_to_typed_requests():
+    """SemIf's build_*.py rows become Kev requests: WANLI as a 3-way choice in SemIf's per-row option order, TypeSafe rows keep
+    their primitive with the reference/published distributions keyed by option id (Kev's option_text adds the `id: ` prefix
+    SemIf bakes into descriptions, so it is stripped)."""
+    from scripts.freeze_semif_external import convert
+    wanli = {"id": "w1", "group_id": "g1", "split": "external_test", "family": "evidence_interpretation", "state": "premise", "question": "Assess: claim",
+             "options": [{"id": "insufficient", "description": "insufficient: neither"}, {"id": "supported", "description": "supported: yes"}, {"id": "contradicted", "description": "contradicted: no"}],
+             "label": 1, "provenance": {"source": "WANLI", "source_revision": "abc", "rights": "CC-BY-4.0"}}
+    rec = convert(wanli, "wanli")
+    q = rec["questions"]["decision"]
+    assert q == {"type": "choice", "instructions": "Assess: claim", "criteria": {"insufficient": "neither", "supported": "yes", "contradicted": "no"}, "label": "supported", "src": "wanli_nli"}
+    assert rec["_meta"]["id"] == "wanli/w1" and rec["_meta"]["group_id"] == "wanli/g1" and rec["_meta"]["variant"] == "clean"
+    ts = {"id": "t1", "group_id": "c1", "split": "external_typesafe_selected", "family": "typesafe_customer_service", "state": '{"ticket": "hi"}', "question": "Angry?",
+          "primitive": "noul", "options": [{"id": "true", "description": "true: yes"}, {"id": "false", "description": "false: no"}], "label": 1, "target_distribution": [0.1, 0.9],
+          "published_models": {"typesafe": {"model": "typesafe:v13", "distribution": [0.2, 0.8]}}, "provenance": {"workflow": "customer_service", "snapshot_sha256": "0" * 64}}
+    rec = convert(ts, "typesafe")
+    assert rec["state"] == {"ticket": "hi"}
+    assert rec["questions"]["decision"] == {"type": "noul", "instructions": "Angry?", "criteria": {"true": "yes", "false": "no"}, "label": False, "src": "typesafe_customer_service"}
+    assert rec["_meta"]["target"] == {"true": 0.1, "false": 0.9} and rec["_meta"]["published"]["typesafe"]["p"] == {"true": 0.2, "false": 0.8}
+    assert rec["_meta"]["row_sha256"] == record_digest({"state": rec["state"], "questions": rec["questions"]})
+
+
+def test_typesafe_equal_case_agreement_and_tvd():
+    """Rows average within a case, cases average equally; a row the model never answered scores agreement 0 / TVD 1."""
+    from scripts.compare_typesafe import case_means, score
+    assert score({"true": 0.7, "false": 0.3}, {"true": 1.0, "false": 0.0}) == (1.0, pytest.approx(0.3))
+    records = [{"_meta": {"id": f"r{i}", "group_id": g}} for i, g in enumerate(["a", "a", "b"])]
+    scores = {"r0": (1.0, 0.0), "r1": (0.0, 0.5)}  # case b unanswered
+    out = case_means(scores, records)
+    assert out["rows"] == 3 and out["cases"] == 2
+    assert out["equal_case_modal_agreement"] == pytest.approx((0.5 + 0.0) / 2)
+    assert out["equal_case_total_variation"] == pytest.approx((0.25 + 1.0) / 2)
+
+
+@pytest.mark.parametrize("suite, rows, tasks", [("wanli-v1", 256, {"wanli_nli"}),
+                                                 ("typesafe-v1", 102, {"typesafe_agent_trace_observability", "typesafe_customer_service", "typesafe_invoice_processing", "typesafe_security_incidents"})])
+def test_semif_external_suites_are_frozen_as_scored(suite, rows, tasks):
+    """The committed selections match SemIf's manifest sizes, are eval-only, carry the unique reference argmax the comparison relies on
+    and record the context they were admitted under (TypeSafe documents need the serving context; 13 of 102 exceed even that)."""
+    from kev.suite import load_split, read_manifest
+    root = pathlib.Path(__file__).resolve().parents[1] / "evals" / "external" / suite
+    manifest = read_manifest(root)
+    records = load_split(root, "development")
+    assert len(records) == rows and manifest["eval_only"] and manifest["holdout_sources"] == [] and set(manifest["tasks"]) == tasks
+    assert len({r["_meta"]["id"] for r in records}) == rows and all(r["_meta"]["variant"] == "clean" for r in records)
+    assert all(r["_meta"]["row_sha256"] == record_digest({"state": r["state"], "questions": r["questions"]}) for r in records)
+    if suite == "typesafe-v1":
+        assert len({r["_meta"]["group_id"] for r in records}) == 20
+        for r in records:
+            target = r["_meta"]["target"]
+            top = sorted(target.values(), reverse=True)
+            assert top[0] > top[1], r["_meta"]["id"]
+            assert set(target) == set(r["questions"]["decision"]["criteria"])
+
+
 def test_rotation_averaging_cancels_a_position_bias():
     import math
     from kev.api import question_keys
@@ -939,16 +990,67 @@ def test_rotation_averaging_cancels_a_position_bias():
         RotationAveraged(biased, 1)
 
 
+def _leaderboard_row(study, trial, acc, seed=0, cfg="c1"):
+    return {"study": study, "trial": trial, "base": "B", "seed": seed, "config": {"k": cfg, "seed": seed}, "config_sha256": f"{cfg}:{seed}", "legacy": False,
+            "gates": {"complete_coverage": True, "isolation_and_packing": True}, "transfer_acc": acc, "transfer_brier": 0.3,
+            "dev_acc": 0.8, "suite_sha256": None, "transfer_suite_sha256": None}
+
+
+def _transfer_rows(correct):
+    from kev.api import question_keys
+    return [{"id": f"r{i}", "question": "q", "group": f"g{i}", "source": "s", "task": "t", "type": "noul", "variant": "clean",
+             "keys": question_keys("noul", None), "label": 1, "p": [0.2, 0.8] if ok else [0.8, 0.2]} for i, ok in enumerate(correct)]
+
+
+def test_challenger_needs_a_noninferior_paired_interval(tmp_path, monkeypatch):
+    from kev import autoresearch
+    from kev.suite import write_json
+    monkeypatch.setattr(autoresearch, "ROOT", tmp_path)
+    n = 400
+    champion_ok = [i % 5 != 0 for i in range(n)]                    # 0.80
+    tiny_lead = [ok or i == 0 for i, ok in enumerate(champion_ok)]  # +1 question: positive delta, lower bound within the margin
+    big_lead = [ok or i % 10 == 0 for i, ok in enumerate(champion_ok)]   # +10 pp
+    for trial, correct in (("champ", champion_ok), ("tiny", tiny_lead), ("big", big_lead), ("worse", [False] * 40 + champion_ok[40:])):
+        (tmp_path / "runs/s" / trial / "transfer").mkdir(parents=True)
+        write_json(tmp_path / "runs/s" / trial / "transfer/rows.json", _transfer_rows(correct))
+    rows = [_leaderboard_row("s", t, 0.8, cfg=t) for t in ("champ", "tiny", "big", "worse", "missing")]
+    champion = autoresearch.as_incumbent([rows[0]])
+    tiny, big, worse, missing = (autoresearch.challenge(champion, r, rows, samples=300) for r in rows[1:])
+    assert tiny["aggregation"] == "macro" and tiny["delta"] > 0 and tiny["ci95"][0] >= -0.01 and tiny["accepted"]
+    assert big["accepted"] and big["ci95"][0] > 0
+    assert not worse["accepted"] and worse["delta"] < 0
+    assert not missing["accepted"] and "error" in missing                          # recorded, never raised after a paid round
+    after, decision = autoresearch.next_incumbent(champion, rows[2], rows)
+    assert decision["accepted"] and after["trials"] == ["s/big"]
+    after, decision = autoresearch.next_incumbent(champion, rows[3], rows)
+    assert not decision["accepted"] and after is champion
+
+
+def test_replication_joins_the_champion_instead_of_challenging_it():
+    from kev.autoresearch import as_incumbent, next_incumbent
+    rows = [_leaderboard_row("s", "a0", 0.80, seed=0, cfg="a"), _leaderboard_row("s", "a1", 0.84, seed=1, cfg="a")]
+    after, decision = next_incumbent(as_incumbent(rows[:1]), rows[1], rows)
+    assert decision is None and after["seeds"] == [0, 1] and after["transfer_acc"] == pytest.approx(0.82)
+
+
+def test_incumbent_is_the_ledger_champion_until_challenged():
+    from kev.autoresearch import incumbent
+    rows = [_leaderboard_row("s", "a", 0.80, cfg="a"), _leaderboard_row("s", "b", 0.81, cfg="b"), _leaderboard_row("t", "a", 0.78, seed=1, cfg="a")]
+    assert incumbent(rows[:2], "B", None, None)["trials"] == ["s/b"]                     # seeding: point estimate
+    history = [{"base": "B", "incumbent_after": {"trials": ["s/a"]}}]
+    assert incumbent(rows, "B", None, None, history)["trials"] == ["s/a", "t/a"]         # sticky champion, plus its later replication
+    assert incumbent(rows[:2], "B", None, None, [{"base": "B", "incumbent_after": {"trials": ["gone/x"]}}])["trials"] == ["s/b"]   # stale ledger falls back
+
+
 def test_max_state_lifts_row_and_packed_limits_together():
     from kev.experiment import validated_trial
-    from kev.model import MAX_BRANCH, MAX_PACKED, MAX_STATE, MAX_TRAIN_STATE, SERVE_MAX_BRANCH, SERVE_MAX_STATE, training_context
+    from kev.model import MAX_BRANCH, MAX_PACKED, MAX_STATE, MAX_TRAIN_STATE, SERVE_MAX_BRANCH, training_context
     from kev.suite import CONTEXT
     assert training_context() == {k: v for k, v in CONTEXT.items() if k != "truncate"} == {"max_state": MAX_STATE, "max_branch": MAX_BRANCH, "max_packed": MAX_PACKED}
     long = 12 * MAX_STATE                                                              # the 4.12 delta's state limit
     lifted = training_context(long)
     assert lifted["max_branch"] - MAX_BRANCH == lifted["max_packed"] - MAX_PACKED == long - MAX_STATE
-    assert MAX_TRAIN_STATE == SERVE_MAX_STATE == 65536                                   # 64k states train and serve
-    assert training_context(MAX_TRAIN_STATE)["max_branch"] <= SERVE_MAX_BRANCH          # the served row limit still fits a training branch
+    assert training_context(MAX_TRAIN_STATE)["max_branch"] == SERVE_MAX_BRANCH          # the served row limit still fits a training branch
     with pytest.raises(ValueError):
         training_context(MAX_TRAIN_STATE + 1)
     manifest = {"base_revisions": {"model": "pinned"}}
@@ -995,24 +1097,3 @@ def test_jsonl_round_trips_unicode_line_separators(tmp_path):
     recs = [{"state": "line one\u2028line two"}, {"state": "next\x85record\u2029end"}, {"state": "plain"}]
     write_jsonl(tmp_path / "x.jsonl", recs)
     assert read_jsonl(tmp_path / "x.jsonl") == recs
-
-
-def test_validated_context_is_the_largest_unbroken_bucket_within_the_margin():
-    from scripts.longdoc_report import validated_context
-    def buckets(lowers, answered=None):
-        out = {b: {"coverage": {"records": 240, "answered": 240}} for b in ("4k", "8k", "16k", "32k", "64k")}
-        for b, lower in lowers.items():
-            out[b]["cuad_paired_vs_8k"] = None if lower is None else {"questions": 450, "delta": lower + 0.02, "ci95": [lower, lower + 0.04], "falls": False}
-        for b, n in (answered or {}).items(): out[b]["coverage"]["answered"] = n
-        return out
-    full = validated_context(buckets({"16k": -0.02, "32k": -0.029, "64k": -0.03}), -0.03)
-    assert full["validated_tokens"] == 65536 and full["first_failure"] is None
-    # 32k breaks the chain: 64k passing on its own does not extend it
-    broken = validated_context(buckets({"16k": -0.01, "32k": -0.031, "64k": 0.0}), -0.03)
-    assert (broken["validated_bucket"], broken["first_failure"], broken["buckets"]["64k"]["within"]) == ("16k", "32k", True)
-    # nothing beyond the trained 4-8k bucket: the reference itself
-    assert validated_context(buckets({"16k": -0.05, "32k": 0.0, "64k": 0.0}), -0.03)["validated_tokens"] == 8192
-    # an unread or partly read bucket is not within tolerance, and neither is anything when 8k is incomplete
-    assert validated_context(buckets({"16k": 0.0, "32k": None, "64k": 0.0}), -0.03)["validated_bucket"] == "16k"
-    assert validated_context(buckets({"16k": 0.0, "32k": 0.0, "64k": 0.0}, {"64k": 239}), -0.03)["validated_bucket"] == "32k"
-    assert validated_context(buckets({"16k": 0.0, "32k": 0.0, "64k": 0.0}, {"8k": 0}), -0.03)["validated_tokens"] == 8192

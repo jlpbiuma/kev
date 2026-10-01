@@ -1,5 +1,5 @@
-"""Long-state records (PLAN.md round 4, item 4.12; PLAN_27b A3; both at git tag research-archive-2026-09-24): a
-decision-v7 record's state buried among unrelated states from the same partition until the state reaches about 1k, 2k or 4k tokens. The question and label are unchanged
+"""Long-state records (PLAN.md round 4, item 4.12; PLAN_27b A3): a decision-v7 record's state buried among unrelated
+states from the same partition until the state reaches about 1k, 2k or 4k tokens. The question and label are unchanged
 and a note names the primary record, as in kev.transfer_v9.buried (which stops at three neighbours and ~400 tokens).
 
     uv run python scripts/build_long_states.py --out evals/round4/longstate-v1
@@ -23,8 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kev.api import render  # noqa: E402
 from kev.data import materialize  # noqa: E402
-from kev.model import MAX_TRAIN_STATE_8K as MAX_TRAIN_STATE, fits, load_tokenizer  # noqa: E402
-from kev.suite import ADMISSION_TOKENIZER as TOKENIZER, SERVING_CONTEXT_8K as SERVING_CONTEXT, digest, load_split, read_manifest, record_digest, write_json, write_jsonl  # noqa: E402
+from kev.model import MAX_TRAIN_STATE, fits, load_tokenizer  # noqa: E402
+from kev.suite import ADMISSION_TOKENIZER as TOKENIZER, SERVING_CONTEXT, digest, load_split, read_manifest, record_digest, write_json, write_jsonl  # noqa: E402
 
 SUITE = "evals/v7/decision-v7"
 LENGTHS = (1024, 2048, 4096)

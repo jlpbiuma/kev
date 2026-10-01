@@ -10,19 +10,20 @@ import argparse, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kev.metrics import metrics, paired_bootstrap, unknowable_report  # noqa: E402
-from kev.rounds import SAMPLES, served_clean, temperature  # noqa: E402
+from kev.metrics import metrics, paired_bootstrap, raw_row, recorded, served, tempered_row, unknowable_report  # noqa: E402
+
+SAMPLES = 2000   # the registered resample count
 from kev.suite import read_json, write_json  # noqa: E402
 
 ARMS = {"candidate": ("runs/r4-soft/00-trial-0", "cand"), "control": ("runs/r4-deltas/01-trial-1", "ctrl"), "parent": ("runs/night2-9b-du/00-trial-0", "parent")}
-EXTERNALS = ("semif", "scienthoon", "wanli", "typesafe")   # as registered 2026-09-22; scienthoon (2026-09-27), wanli and typesafe (2026-09-30) were removed as evals, their committed reads stay
+EXTERNALS = ("semif", "scienthoon", "wanli", "typesafe")
 KEYS = ("n", "acc", "brier", "ece", "confident_error_rate", "coverage_at_5pct_error", "aurc")
 
 
-def arm(tag, suite, t):
+def arm(tag, suite, temperature):
     """(knowable rows, every clean row incl. unknowable) of one arm on one suite, served at its temperature. The knowable
     subset is exactly what kev.metrics.served_at scores; the unknowable rows are kept for unknowable_report."""
-    everything = served_clean(read_json(f"runs/rc-{tag}-{suite}/rows.json"), t)
+    everything = [tempered_row(raw_row(recorded(r)), temperature) for r in read_json(f"runs/rc-{tag}-{suite}/rows.json") if r["variant"] == "clean"]
     return [r for r in everything if r["source"] != "unknowable"], everything
 
 
@@ -32,7 +33,7 @@ def main():
     report = {"registered": "PLAN.md, Release confirmation: soft-target Kev-9B", "temperature": {}, "final_panel": {}, "transfer_v9": {}, "externals": {}}
     panel, v9 = {}, {}
     for name, (trial, tag) in ARMS.items():
-        t = report["temperature"][name] = temperature(trial, ".")   # fitted on the arm's own development rows
+        t = report["temperature"][name] = served(read_json(Path(trial) / "development/rows.json"), [])[0]   # fitted on the arm's own development rows
         knowable, everything = arm(tag, "r3test", t); panel[name] = knowable
         report["final_panel"][name] = {**{k: metrics(knowable)[k] for k in KEYS}, "unknowable": unknowable_report(everything)}
         v9[name] = unknowable_report(arm(tag, "v9", t)[1])

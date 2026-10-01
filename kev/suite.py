@@ -1,20 +1,16 @@
 import argparse
 import copy
-import fcntl
 import hashlib
 import json
-import os
 import random
 import shutil
 from collections import Counter
-from contextlib import contextmanager
 from pathlib import Path
 
 from kev.composition import DEV_SHAPES, HELD_OUT_KEYS, TEST_SHAPES, TRAIN_SHAPES
 from kev.contrastive import FAMILIES, generate
 from kev.data import ALL_REPOS, ALL_SOURCES, EVAL_ONLY, REPOS, SOURCES, TRAINABLE, TRANSFER_REPOS, TRANSFER_SOURCES, build, dataset_ref, materialize, source_seed
-from kev.model import (MAX_BRANCH, SERVE_MAX_BRANCH, SERVE_MAX_BRANCH_8K, SERVE_MAX_PACKED, SERVE_MAX_STATE, SERVE_MAX_STATE_8K, fits, load_tokenizer,
-                       training_context)
+from kev.model import MAX_BRANCH, SERVE_MAX_BRANCH, SERVE_MAX_PACKED, SERVE_MAX_STATE, fits, load_tokenizer, training_context
 
 SPLITS = ("train", "calibration", "development", "test")
 BASES = ("Qwen/Qwen2.5-0.5B", "Qwen/Qwen3-0.6B-Base")
@@ -22,10 +18,6 @@ BASES = ("Qwen/Qwen2.5-0.5B", "Qwen/Qwen3-0.6B-Base")
 CONTEXT = {**training_context(), "truncate": False}
 # what a manifest records for an eval-only suite frozen as published rather than admitted to the training context
 SERVING_CONTEXT = {"max_state": SERVE_MAX_STATE, "max_branch": SERVE_MAX_BRANCH, "max_packed": SERVE_MAX_PACKED, "truncate": False}
-# the serving context before 64k states: what the suites frozen until then record and were admitted under; their builders
-# (hard-v1, devtools-v1, breadth-v1, long states, semif/typesafe, documents-v1) keep it and kev.model.MAX_TRAIN_STATE_8K,
-# so they still rebuild byte for byte
-SERVING_CONTEXT_8K = {"max_state": SERVE_MAX_STATE_8K, "max_branch": SERVE_MAX_BRANCH_8K, "max_packed": SERVE_MAX_STATE_8K + SERVE_MAX_BRANCH_8K, "truncate": False}
 # Clean records are admitted with this many branch tokens to spare, so the variants that add an option (contrast_cases'
 # none-of-these, training-time none/distractor augmentation) still encode under MAX_BRANCH.
 ADMISSION_BRANCH_HEADROOM = 64
@@ -36,75 +28,13 @@ ADMISSION_BRANCH_HEADROOM = 64
 # usually the private PRIVATE_DATASET; only its manifest is in git, which publishes the hashes but not the text.
 SUITES_DATASET = "jaredpalmer/kev-suites"
 PRIVATE_DATASET = "jaredpalmer/kev-private-evals"
-SUITES_REVISION = "cc4bac803e73112689ec327ffa481c519cbc7a05"
+SUITES_REVISION = "a88f56db5341397299137cb68775c2ea6e3f68cb"
 # partitions larger than this stay out of git (gitignored; the manifest's sha256 still pins them)
 GIT_LIMIT = 10 * 1024 * 1024
 # the pinned tokenizer suites built for the Qwen3.5 family are admitted and length-counted under (hard-v1, devtools-v1, long states)
 ADMISSION_TOKENIZER = ("Qwen/Qwen3.5-4B-Base", "1001bb4d826a52d1f399e183466143f4da7b741b")
 # programmatic policy sources (kev.study_v3 / kev.contrastive); the trainer's mix ablations treat them as one group
 SYNTHETIC_SOURCES = ("legacy_policy", "compositional", "contrastive")
-# Suites deleted from the repo because they are unsound as a gate: {suite dir: why, when, the last round that read it}.
-# load_split / read_manifest refuse them with the reason; kev.rounds.validate lists a read of one as archived for rounds up
-# to `last_round` (their committed rows under runs/ are the record and still reproduce) and refuses it after that.
-REMOVED_SUITES = {
-    "evals/external/scienthoon-v1": {
-        "removed": "2026-09-27",
-        "last_round": 22,
-        "reason": ("unsound as a gate: 291 templated synthetic support tickets x 3 questions; `queue` is saturated (0.948-0.952 "
-                   "for every 27B), `priority` is unlearnable by construction (its own manifest: the label follows an org rule "
-                   "absent from the text), and `angry` has 15 of 291 gold labels that contradict the text and turns on ~12 stock "
-                   "closing phrases with disputed conventions"),
-        "record": "PLAN.md (Standing rules; 2026-09-27 note); committed rows under runs/ (e.g. runs/r20-scienthoon)",
-    },
-    "evals/external/wanli-v2": {
-        "removed": "2026-09-30",
-        "last_round": 26,
-        "reason": ("unsound as a gate: 271 of its 1,002 WANLI test pairs (27 %) are ones WANLI's two crowd annotators labelled "
-                   "differently, and the published gold is one of the two labels; every Kev scores 49-62 % on those against "
-                   "64-81 % on the 731 the annotators agreed on, and the 2026-09-27 audit measured split-half r 0.04 across 23 "
-                   "checkpoints (all within 0.735-0.763), a half-width as wide as its 2 pp bar and ~11 % invalid labels"),
-        "record": "PLAN.md (Standing rules; 2026-09-30 note); committed rows under runs/ (e.g. runs/r23-27b-k-w85-wanli2)",
-    },
-    "evals/external/wanli-v1": {
-        "removed": "2026-09-30",
-        "last_round": 5,
-        "reason": ("the same WANLI test pairs as wanli-v2 (SemIf's 256): 63 of 256 (25 %) are ones WANLI's two crowd annotators "
-                   "labelled differently, and the published gold is one of the two labels"),
-        "record": "PLAN.md (2026-09-30 note); README; committed rows under runs/ (e.g. runs/kev-9b-wanli-v1, runs/jev-wanli-v1)",
-    },
-    "evals/external/typesafe-v1": {
-        "removed": "2026-09-30",
-        "last_round": 26,
-        "reason": ("unsound as a gate: its gold is not a ground truth but the argmax of the average of two closed frontier models' "
-                   "answers (evals.typesafe.ai: GPT-6 Astra and Claude Fable 5.1), 13 of its 102 reference distributions put "
-                   "the answer below 0.75 (the two references split), and on 89 answered questions from 20 cases the split-half "
-                   "correlation across 20 Kev-27B checkpoints is -0.01 (2026-09-27 audit: -0.27): its differences between "
-                   "checkpoints are noise"),
-        "record": "PLAN.md (Standing rules; 2026-09-30 note); README; committed rows under runs/ (e.g. runs/kev-9b-typesafe-v1)",
-    },
-}
-
-
-class RemovedSuite(ValueError):
-    """A read of a suite in REMOVED_SUITES."""
-
-
-def suite_key(path):
-    """'evals/...' for a suite path given relative, absolute or as a container saw it (/root/kev/evals/x); None if none."""
-    parts = Path(str(path)).parts
-    return str(Path(*parts[parts.index("evals"):])) if "evals" in parts else None
-
-
-def removed_suite(path):
-    """The REMOVED_SUITES entry of a suite path (any form suite_key accepts), or None."""
-    key = suite_key(path)
-    return REMOVED_SUITES.get(key) if key else None
-
-
-def refuse_removed(path):
-    if entry := removed_suite(path):
-        raise RemovedSuite(f"{suite_key(path)} was removed on {entry['removed']}: {entry['reason']}. Rounds up to "
-                           f"{entry['last_round']} read it; their committed rows are the record ({entry['record']}). Do not read it again.")
 
 
 def digest(path):
@@ -139,25 +69,8 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding=ENCODING))
 
 
-def write_json(path, value, atomic=False):
-    """atomic: write a sibling temp file and os.replace it over `path`, so a reader (or a restart after a crash mid-write)
-    sees the old file or the new one, never a torn one. For state files rewritten in place (kev.rounds' watcher)."""
-    text = json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-    if not atomic:
-        Path(path).write_text(text, encoding=ENCODING); return
-    tmp = Path(path).with_name(f".{Path(path).name}.tmp")
-    tmp.write_text(text, encoding=ENCODING)
-    os.replace(tmp, path)
-
-
-@contextmanager
-def file_lock(path):
-    """Hold an exclusive advisory lock on `path` (created if absent) for the block; a second holder waits. Local
-    orchestration only: one pull of a study (modal_app.pull_lock), one launch of an arm's reads (kev.rounds)."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with Path(path).open("a", encoding=ENCODING) as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding=ENCODING)
 
 
 def read_jsonl(path):
@@ -197,12 +110,10 @@ def validate_training(records, manifest):
 
 
 def read_manifest(directory):
-    refuse_removed(directory)
     return read_json(Path(directory) / "manifest.json")
 
 
 def load_split(directory, split, allow_test=False):
-    refuse_removed(directory)   # a removed suite is refused with its reason, not a missing-file error
     if split not in SPLITS:
         raise ValueError(f"unknown split: {split}")
     if split == "test" and not allow_test:

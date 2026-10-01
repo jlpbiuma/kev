@@ -31,19 +31,15 @@ Modal's official skill and documentation, which helps with anything beyond this 
 
 | `KEV_MODEL` | GPU (automatic; fallbacks in parentheses) | $/h while up | Model time, 6 questions (new / repeated state) | Cold start (cached weights) | When |
 | --- | --- | --- | --- | --- | --- |
-| `jaredpalmer/kev-0.8b` | L4 (L40S) | 0.80 | 23 / 16 ms | ~40 s | cheapest, prototyping |
-| `jaredpalmer/kev-4b` (default) | L40S (H100) | 1.95 | 42 / 28 ms (H100: 18 / 13 ms) | ~35 s | the default: best quality per dollar |
-| `jaredpalmer/kev-9b` | H100 (H200, L40S) | 3.95 | 24 / 17 ms | ~55 s | accuracy on smaller GPUs |
-| `jaredpalmer/kev-27b` | B200 (H200, H100) | 6.25 | 47 / 32 ms (H200: 67 / 50 ms) | ~50 s | best released accuracy; 51 GB of full weights |
+| `jaredpalmer/kev-0.8b` | L4 (L40S) | 0.80 | 37 / 28 ms | ~40 s | cheapest, prototyping |
+| `jaredpalmer/kev-4b` (default) | L40S (H100) | 1.95 | 50 / 34 ms (H100: 30 / 20 ms) | ~35 s | the default: best quality per dollar |
+| `jaredpalmer/kev-9b` | H100 (H200, L40S) | 3.95 | 37 / 24 ms (L40S: 80 / 53 ms) | ~55 s | best released accuracy |
 
-Model time is the `latency_ms` the API returns (median of 20 requests, measured in the Kev repo: `runs/serve-*`,
-`runs/grouping-4b-h100`, `runs/fused-27b-*` and `runs/serving-27b-r23`; Kev-27B's B200 and H100 figures were measured on its
-previous version, the same architecture in bf16). A new state is the normal call, since every ticket is a
-new state; a repeated state is served from a prefix cache. The very first cold start of an account also downloads the
-weights and compiles kernels (1-2 minutes); both are cached on the `kev-hf-cache` volume afterwards. Other GPUs work with
-`KEV_GPU` but are worse picks: an L4 runs out of compute on Kev-4B, and an A100 is slower than an L40S here and costs more.
-Kev-27B is compute-bound under load: a B200 serves ~57 mixed requests/s at 64 concurrent clients (H200 ~40, H100 ~36) for
-about the same cost per request, with the lowest latency. Its first cold start downloads 51 GB of weights (several minutes).
+Model time is the `latency_ms` the API returns (median of 20 requests, measured in the Kev repo: `runs/serving-*/report.json`).
+A new state is the normal call, since every ticket is a new state; a repeated state is served from a prefix cache. The very
+first cold start of an account also downloads the weights and compiles kernels (1-2 minutes); both are cached on the
+`kev-hf-cache` volume afterwards. Other GPUs work with `KEV_GPU` but are worse picks: an L4 runs out of compute on Kev-4B
+(6 questions: ~157 / 116 ms), and an A100 is slower than an L40S here and costs more.
 
 A warm container costs the GPU's hourly rate only while it is up; after five idle minutes it scales to zero.
 `KEV_MIN_CONTAINERS=1` keeps one warm (no cold starts, pays the hourly rate all the time). `@revision` pins a checkpoint
@@ -65,23 +61,7 @@ Settings are read at deploy time; redeploying with other values replaces the mod
 `KEV_GPU=H100` overrides the GPU list (comma-separated). `KEV_REGION=us` (or `us-east`, `eu`, ...) pins where the container
 runs: without it Modal takes the first region with a free GPU, which can be another continent (an unpinned Kev-4B landed in
 Frankfurt and added ~150 ms to every round trip from the US). A pinned region costs 1.15-1.75x on Modal; pin it near the
-callers for latency-sensitive use. `KEV_TRUNCATE_STATES=1` reads the first 65,536 tokens of a longer document instead
-of refusing it (see Long documents under Troubleshooting).
-
-### Throughput
-
-A container answers concurrent requests in batches: its model thread takes everything waiting and runs it through shared
-passes. In-process, Kev-4B on an H100 serves about 95 six-question requests/s (120 on mixed short records); an L40S about
-45. Over HTTP the front door matters more than the GPU (Kev-4B, H100, a client in the same region, measured 2026-09-24):
-
-| Front door | One request, round trip | 8 / 32 concurrent clients | Scaling |
-| --- | --- | --- | --- |
-| web endpoint (default) | ~77 ms | 77 / 103 req/s | Modal adds containers past 32 concurrent requests each |
-| `KEV_FLASH=1` (experimental) | ~46 ms | 70 / 112 req/s per container | one container stays up; past ~32 concurrent per container requests queue at the proxy (p99 ~4 s at 64) |
-
-For steady high traffic, keep containers warm (`KEV_MIN_CONTAINERS=2` or more) so bursts do not wait for a cold start, and
-size it at about 32 concurrent requests per container. `KEV_FLASH=1` needs `KEV_REGION` (its proxy is regional) and its
-URL is printed as `https://<workspace>--<app>-kev.<region>.modal.direct`.
+callers for latency-sensitive use.
 
 ## 4. Verify
 
@@ -144,15 +124,4 @@ modal volume delete kev-hf-cache   # optional: the cached weights (shared with k
 - **Slow round trips with fast `latency_ms`**: the container is far from the caller or every request opens a new
   connection; set `KEV_REGION` and reuse the HTTP client.
 - **401 with the right key**: the key is fixed at deploy time; redeploy with the same `KEV_API_KEY` exported.
-- **Long documents**: a state may have up to 65,536 tokens and a question with its options 8,192 more (more when the
-  state is shorter). A longer state gets a 422 that gives its token count and the limit (the TypeSafe SDK raises
-  `TypeSafeUnprocessableEntityError` with that message), as a longer question does: shorten or split the document.
-  Deploying with `KEV_TRUNCATE_STATES=1` reads only the first 65,536 tokens instead, and then every response carries
-  `truncated` and `usage.state_tokens` / `state_tokens_used`. Kev-27B
-  trained on states of up to 32,768 tokens and the smaller models on 384, so all four accept long documents but Kev-27B
-  answers them best. A new long state is slow, a repeated one is served from the prefix cache: Kev-27B on an H200 took
-  8-10 s for a 60k-token state and 0.28 s for the same request again; a 70k-token state read to 65,536 tokens with
-  `KEV_TRUNCATE_STATES=1` took 12 s, then 0.29 s. The cache holds 65,536 state tokens in all, so a new state that long
-  replaces the cached one, which is dropped before the new state's pass rather than after it (no second copy resident)
-  (`runs/kev-deploy-71d4829` and `runs/kev-deploy-2ea5660` in the repo).
 - **Logs**: `modal app logs kev` shows the load line (`serving <model> on <GPU> ... ready in Ns`) and every request.
